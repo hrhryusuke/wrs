@@ -1,13 +1,12 @@
 """
 ---get_camrobot_coordinate---
 操作者の手のセンサ情報から，カメラロボット座標系を定義
-操作を開始
 
 ---備考---
 リアルタイム更新と初期時刻で固定か選択可能
 
 ---更新日---
-20230118
+20230111
 """
 
 import cv2
@@ -199,7 +198,7 @@ def tangent_angle(v0, v1):
     cross = np.cross(v0, v1)
     norm = np.linalg.norm(v0) * np.linalg.norm(v1)
     angle = np.arccos(np.clip(inner / norm, -1.0, 1.0))
-    if cross[2] >= 0:
+    if cross >= 0:
         return angle
     else:
         return -1 * angle
@@ -210,8 +209,8 @@ def operate_camrobot(task):
         abnormal_flag, abnormal_count, stop_standard_pos, stop_standard_rot, cancel_pos_displacement, cancel_euler_displacement
 
     # 異常動作検知の閾値
-    threshold_abnormal_jnt_values = 1
-    threshold_abnormal_jnt_values_norm = 1
+    threshold_abnormal_jnt_values = 0.5
+    threshold_abnormal_jnt_values_norm = 0.5
 
     # データ受信が出来ているかの判定
     if data_adjustment(data_list) is False:
@@ -247,37 +246,28 @@ def operate_camrobot(task):
                      rgbmatrix=operator_coordinate_frame_color).attach_to(base)
 
         operator_direction_vector = np.dot(operator_coordinate, np.array([1, 0, 0]))
-        rotation_world_to_operator = tangent_angle(np.array([1, 0, 0]), operator_direction_vector)
+        rotation_world_to_operator = tangent_angle(v0=np.array([1, 0, 0], v1=operator_direction_vector))
 
         # カメラロボット座標系の定義
         init_operator_hand_rot = np.dot(np.linalg.pinv(operator_coordinate),
                                         rm.rotmat_from_quaternion(data_array[(rgt_hand_num + 6):(rgt_hand_num + 10)])[:3, :3])
         camrobot_direction_vector = np.dot(init_operator_hand_rot, np.array([0, 0, 1]))
-        rotation_operator_to_camrobot = tangent_angle(operator_direction_vector, camrobot_direction_vector)
-
-
-        init_operator_hand_pos = np.dot(np.linalg.pinv(operator_coordinate), data_array[rgt_hand_num:(rgt_hand_num + 3)])
-        gm.gen_frame(pos=init_operator_hand_pos, rotmat=init_operator_hand_rot).attach_to(base)
-        gm.gen_dashstick(spos=init_operator_hand_pos,
-                         epos=np.array([init_operator_hand_pos[0], init_operator_hand_pos[1], 0])).attach_to(base)
-        gm.gen_arrow(spos=np.array([init_operator_hand_pos[0], init_operator_hand_pos[1], 0]),
-                     epos=np.array([init_operator_hand_pos[0] + camrobot_direction_vector[0], init_operator_hand_pos[1] + camrobot_direction_vector[1], 0])).attach_to(base)
-        gm.gen_arrow(spos=[0, 0, 0], epos=np.array([camrobot_direction_vector[0], camrobot_direction_vector[1], camrobot_direction_vector[2]]),
-                     thickness=0.05)
-
+        rotation_operator_to_camrobot = tangent_angle(v0=operator_direction_vector, v1=camrobot_direction_vector)
+        # init_operator_hand_pos = np.dot(np.linalg.pinv(operator_coordinate), data_array[rgt_hand_num:(rgt_hand_num + 3)])
+        # gm.gen_frame(pos=init_operator_hand_pos, rotmat=init_operator_hand_rot).attach_to(base)
+        # gm.gen_dashstick(spos=init_operator_hand_pos,
+        #                  epos=np.array([init_operator_hand_pos[0], init_operator_hand_pos[1], 0])).attach_to(base)
+        # gm.gen_arrow(spos=np.array([init_operator_hand_pos[0], init_operator_hand_pos[1], 0]),
+        #              epos=np.array([init_operator_hand_pos[0] + camrobot_direction_vector[0], init_operator_hand_pos[1] + camrobot_direction_vector[1], 0])).attach_to(base)
         camrobot_coordinate = rm.rotmat_from_axangle(axis=[0, 0, 1],
-                                                     angle=rotation_world_to_operator + rotation_operator_to_camrobot)
-        camrobot_coordinate_frame_color = np.array([[106, 76, 156],
-                                                    [106, 76, 156],
-                                                    [106, 76, 156]]) / 255
-        gm.gen_frame(rotmat=camrobot_coordinate, length=2, thickness=0.03, rgbmatrix=camrobot_coordinate_frame_color).attach_to(base)
+                                                     angle=rotation_operator_to_camrobot)
+        gm.gen_frame(rotmat=camrobot_coordinate, length=2, thickness=0.03).attach_to(base)
         rbt_s.fk(component_name="agv",
                  jnt_values=np.array([0, 0, rotation_world_to_operator + rotation_operator_to_camrobot]))
 
         # 初期エラー等の記録
         init_tcp_pos, init_tcp_rot = rbt_s.get_gl_tcp()
-        gm.gen_frame(pos=init_tcp_pos, rotmat=init_tcp_rot).attach_to(base)
-        init_error = init_operator_hand_pos - init_tcp_pos
+        init_error = np.dot(np.linalg.pinv(operator_coordinate), data_array[rgt_hand_num:(rgt_hand_num+3)])-init_tcp_pos
         pre_jnt_values = rbt_s.get_jnt_values(component_name="arm")
     else:
         # マニピュレータの手先の座標系表示
@@ -285,12 +275,11 @@ def operate_camrobot(task):
         operator_hand_rot = np.dot(np.linalg.pinv(operator_coordinate),
                                    rm.rotmat_from_quaternion(data_array[(rgt_hand_num + 6):(rgt_hand_num + 10)])[:3, :3])
 
-        # 逆運動学の解を導出
+        # 操作者座標系から見た右手の位置姿勢についてLM法で逆運動学の解を導出
         camrobot_hand_pos = operator_hand_pos
-        camrobot_hand_rot = operator_hand_rot
-        camrobot_hand_rot = np.dot(rm.rotmat_from_axangle(axis=np.dot(camrobot_hand_rot, [0, 0, 1]),
-                                                          angle=math.pi),
-                                   camrobot_hand_rot)
+        camrobot_hand_rot = rm.rotmat_from_euler(ai=-1*rm.rotmat_to_euler(operator_hand_rot)[1],
+                                                 aj=rm.rotmat_to_euler(operator_hand_rot)[0],
+                                                 ak=rm.rotmat_to_euler(operator_hand_rot)[2])
 
         current_jnt_values = rbt_s.manipulator_dict['arm'].jlc._ikt.num_ik(tgt_pos=camrobot_hand_pos - init_error - cancel_pos_displacement,
                                                                            tgt_rot=np.dot(rm.rotmat_from_euler(ai=cancel_euler_displacement[0], aj=cancel_euler_displacement[1], ak=cancel_euler_displacement[2]),
