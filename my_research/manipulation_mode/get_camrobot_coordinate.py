@@ -6,7 +6,7 @@
 リアルタイム更新と初期時刻で固定か選択可能
 
 ---更新日---
-20221214
+20230111
 """
 
 import cv2
@@ -23,14 +23,14 @@ import basis.robot_math as rm
 import visualization.panda.world as wd
 import modeling.geometric_model as gm
 import robot_sim.robots.xarm_shuidi.xarm_shuidi as xsm
-import robot_con.xarm_shuidi.xarm_shuidi_x as xsc
-import drivers.devices.realsense_rpi.realsense_client as realsense_client
+# import robot_con.xarm_shuidi.xarm_shuidi_x as xsc
+# import drivers.devices.realsense_rpi.realsense_client as realsense_client
 
 from direct.task.TaskManagerGlobal import taskMgr
 
 # -------------------------各種標準設定-------------------------
 # 描画系統
-base = wd.World(cam_pos=[5, 5, 2], lookat_pos=[0, 0, 1]) # モデリング空間を生成
+base = wd.World(cam_pos=[0, 0, 3], lookat_pos=[0, 0, 0.5]) # モデリング空間を生成
 rbt_s = xsm.XArmShuidi(enable_cc=True) # ロボットモデルの読込
 
 # 通信系統
@@ -58,7 +58,25 @@ adjusment_rotmat_hip = np.array([[0, 0, -1],
 # ----------------------
 data_array = []
 onscreen = []
-count = 0
+onscreen_tcp = []
+onscreen_operator = []
+operation_count = 0
+
+# アーム・台車動作系統
+init_error = np.zeros(3)
+init_tcp_rot = np.eye(3)
+current_jnt_values = None
+pre_jnt_values = None
+pre_agv_pos = np.zeros(3)
+
+# 異常動作検知系統
+abnormal_flag = False
+abnormal_count = 0
+abnormal_cancel_count = 0
+stop_standard_pos = np.zeros(3)
+stop_standard_rot = np.zeros((3, 3))
+cancel_pos_displacement = np.zeros(3)
+cancel_euler_displacement = np.zeros(3)
 # ----------------------
 
 
@@ -67,6 +85,7 @@ def model_remove(onscreen):
     for item in onscreen:
         item.detach()
     onscreen.clear()
+
 
 # データ受信用関数
 def data_collect(data_list):
@@ -92,7 +111,7 @@ def data_adjustment(data_list):
     # データ型の調整
     b_msg = data_list[0]
     if b_msg is None:
-        return "No Data"
+        return False
     tmp_data_array = np.frombuffer(b_msg, dtype=np.float32)
 
     # 座標調整
@@ -116,24 +135,84 @@ def data_adjustment(data_list):
     return data_array
 
 
-def get_camrobot_coordinate(task):
+def abnormal_judgement(standard_pos, standard_rot, current_pos, current_rot, is_stable_cancel):
+    global abnormal_count, abnormal_cancel_count, cancel_pos_displacement, cancel_euler_displacement
+    threshold_pos = 0.05
+    threshold_rot_euler = 0.5
+
+    pre_judge_pos = np.zeros(3)
+    pre_judge_rot = np.zeros((3, 3))
+
+    # 動作停止時の手の位置姿勢を記録
+    if abnormal_count == 1:
+        pre_judge_pos = current_pos
+        pre_judge_rot = current_rot
+
+    pos_judge = (abs(current_pos - standard_pos) <= threshold_pos).all()
+    rot_judge = np.linalg.norm(rm.rotmat_to_euler(current_rot) - rm.rotmat_to_euler(standard_rot), ord=2) <= threshold_rot_euler
+    print(f"displacement[pos]{abs(current_pos - standard_pos)}, [euler_norm]{np.linalg.norm(rm.rotmat_to_euler(current_rot) - rm.rotmat_to_euler(standard_rot), ord=2)}")
+    print(f"judgement[pos]{pos_judge}, [euler_norm]{rot_judge}")
+
+    if pos_judge and rot_judge:
+        # マニピュレータの手先の位置姿勢と操作者の手先の位置姿勢の比較
+        # 動作復帰条件クリア
+        abnormal_cancel_count = 0
+        print('operating restart!!')
+        return False
+    elif is_stable_cancel == True:
+        # 操作者の手先の位置姿勢の比較
+        # 一定時間手を動かさなければ動作復帰
+        if np.all(current_pos - pre_judge_pos) <= 0.5 and np.all(rm.rotmat_to_euler(current_rot)-rm.rotmat_to_euler(pre_judge_rot)) <= 0.5:
+            abnormal_cancel_count += 1
+            pre_judge_pos = current_pos
+            pre_judge_rot = current_rot
+        else:
+            abnormal_cancel_count = 0
+
+        if abnormal_cancel_count <= 30:
+            if abnormal_count == 1:
+                print("abnormal operation is detected")
+            print(f'pos_error: {abs(current_pos - standard_pos)}, euler_error: {rm.rotmat_to_euler(current_rot) - rm.rotmat_to_euler(standard_rot)}')
+            return True
+        else:
+            print('operating is restarted!!')
+            cancel_pos_displacement += current_pos - standard_pos
+            cancel_euler_displacement += rm.rotmat_to_euler(standard_rot) - rm.rotmat_to_euler(current_rot)
+            print(f'cancel_pos_displacement:{cancel_pos_displacement}, cancel_euler_displacement:{cancel_euler_displacement}')
+            abnormal_cancel_count = 0
+            return False
+    else:
+        return True
+
+
+def operate_camrobot(task):
+    global data_array, init_error, init_tcp_rot, current_jnt_values, pre_jnt_values, operation_count, operator_coordinate, camrobot_coordinate, \
+        abnormal_flag, abnormal_count, stop_standard_pos, stop_standard_rot, cancel_pos_displacement, cancel_euler_displacement
+
+    # 異常動作検知の閾値
+    threshold_abnormal_jnt_values = 0.5
+    threshold_abnormal_jnt_values_norm = 0.5
+
     # データ受信が出来ているかの判定
-    if data_adjustment(data_list) == "No Data":
+    if data_adjustment(data_list) is False:
         return task.cont
     else:
         data_array = data_adjustment(data_list)
 
     # リアルタイム描画のため、各時刻のモデルを除去
     model_remove(onscreen)
+    model_remove(onscreen_tcp)
+    model_remove(onscreen_operator)
 
-    # 操作者座標系の定義
-    if count == 0:
+    if operation_count == 0:
         b_msg = data_list[0]
         if b_msg is None:
-            return "No Data"
+            return task.cont
         tmp_data_array = np.frombuffer(b_msg, dtype=np.float32)
         tmp_euler = rm.rotmat_to_euler(
             np.dot(adjusment_rotmat_hip, rm.rotmat_from_quaternion(tmp_data_array[hip_num + 6: hip_num + 10])[:3, :3]))
+
+        # 操作者座標系の定義
         operator_coordinate_euler = np.zeros(3)
         operator_coordinate_euler[0] = tmp_euler[2]
         operator_coordinate_euler[1] = -tmp_euler[1]
@@ -141,15 +220,132 @@ def get_camrobot_coordinate(task):
         operator_coordinate[:2, :2] = rm.rotmat_from_euler(ai=operator_coordinate_euler[0],
                                                            aj=operator_coordinate_euler[1],
                                                            ak=operator_coordinate_euler[2])[:2, :2]
+        operator_direction_vector = np.dot(operator_coordinate, np.array([1, 0, 0]))
+        cross_worope = np.cross([1, 0, 0], operator_direction_vector)
         operator_coordinate_frame_color = np.array([[0, 1, 1],
                                                     [1, 0, 1],
                                                     [1, 1, 0]])
         gm.gen_frame(pos=np.zeros(3), rotmat=operator_coordinate, length=2, thickness=0.03,
                      rgbmatrix=operator_coordinate_frame_color).attach_to(base)
+        rotation_of_operator = np.arccos(np.clip(np.inner([1, 0, 0], operator_direction_vector) / (np.linalg.norm(operator_direction_vector)),
+                                                 -1.0, 1.0))
+        if cross_worope[2] < 0:
+            rotation_of_operator *= -1
 
+        # カメラロボット座標系の定義
+        init_operator_hand_pos = np.dot(np.linalg.pinv(operator_coordinate), data_array[rgt_hand_num:(rgt_hand_num + 3)])
+        init_operator_hand_rot = np.dot(np.linalg.pinv(operator_coordinate),
+                                        rm.rotmat_from_quaternion(data_array[(rgt_hand_num + 6):(rgt_hand_num + 10)])[:3, :3])
+        gm.gen_frame(pos=init_operator_hand_pos, rotmat=init_operator_hand_rot).attach_to(base)
+        camrobot_direction_vector = np.dot(init_operator_hand_rot, np.array([0, 0, 1]))
+        cross_opecam = np.cross(operator_direction_vector, camrobot_direction_vector)
+        gm.gen_dashstick(spos=init_operator_hand_pos,
+                         epos=np.array([init_operator_hand_pos[0], init_operator_hand_pos[1], 0])).attach_to(base)
+        gm.gen_arrow(spos=np.array([init_operator_hand_pos[0], init_operator_hand_pos[1], 0]),
+                     epos=np.array([init_operator_hand_pos[0] + camrobot_direction_vector[0], init_operator_hand_pos[1] + camrobot_direction_vector[1], 0])).attach_to(base)
+        rotation_of_camrobot = np.arccos(np.clip(np.inner(operator_direction_vector, camrobot_direction_vector) / (np.linalg.norm(operator_direction_vector) * np.linalg.norm(camrobot_direction_vector)),
+                                                 -1.0, 1.0))
+        if cross_opecam[2] < 0:
+            rotation_of_camrobot *= -1
+        print(rotation_of_camrobot)
+        camrobot_coordinate = np.dot(operator_coordinate, rm.rotmat_from_axangle(axis=[0, 0, 1], angle=rotation_of_camrobot))
+        gm.gen_frame(rotmat=camrobot_coordinate, length=2, thickness=0.03).attach_to(base)
+        print(rbt_s.get_jnt_values(component_name="agv"))
+        rbt_s.fk(component_name="agv", jnt_values=np.array([0, 0, rotation_of_operator + rotation_of_camrobot]))
+        print(rbt_s.get_jnt_values(component_name="agv"))
 
+        # 初期エラー等の記録
+        init_tcp_pos, init_tcp_rot = rbt_s.get_gl_tcp()
+        # gm.gen_frame(pos=init_tcp_pos, rotmat=init_tcp_rot).attach_to(base)
+        init_error = np.dot(np.linalg.pinv(camrobot_coordinate), data_array[rgt_hand_num:(rgt_hand_num + 3)]) - init_tcp_pos
+        pre_jnt_values = rbt_s.get_jnt_values(component_name="arm")
+    else:
+        tcp_pos, tcp_rot = rbt_s.manipulator_dict['arm'].jlc.get_gl_tcp()
+        # マニピュレータの手先の座標系表示
+        # onscreen_tcpframe.append(gm.gen_frame(pos=tcp_pos, rotmat=tcp_rot, length=0.3))
+        # onscreen_tcpframe[-1].attach_to(base)
+
+        operator_hand_pos = np.dot(np.linalg.pinv(operator_coordinate), data_array[(rgt_hand_num):(rgt_hand_num + 3)])
+        operator_hand_rot = np.dot(np.linalg.pinv(operator_coordinate),
+                                   rm.rotmat_from_quaternion(data_array[(rgt_hand_num + 6):(rgt_hand_num + 10)])[:3, :3])
+        onscreen_operator.append(gm.gen_frame(pos=operator_hand_pos, rotmat=operator_hand_rot))
+        onscreen_operator[-1].attach_to(base)
+
+        # 操作者座標系から見た右手の位置姿勢についてLM法で逆運動学の解を導出
+        camrobot_hand_pos = np.dot(np.linalg.pinv(camrobot_coordinate), data_array[(rgt_hand_num):(rgt_hand_num + 3)])
+        camrobot_hand_rot = np.dot(np.linalg.pinv(camrobot_coordinate), rm.rotmat_from_quaternion(data_array[(rgt_hand_num+6):(rgt_hand_num+10)])[:3, :3])
+        # camrobot_hand_rot = rm.rotmat_from_quaternion(data_array[(rgt_hand_num + 6):(rgt_hand_num + 10)])[:3, :3]
+        # 補正
+        camrobot_hand_rot = np.dot(rm.rotmat_from_axangle(axis=np.dot(camrobot_hand_rot, [0, 0, 1]),
+                                                          angle=math.pi),
+                                   camrobot_hand_rot)
+        camrobot_hand_rot = np.dot(rm.rotmat_from_axangle(axis=np.dot(camrobot_hand_rot, [1, 0, 0]),
+                                                          angle=math.pi/4),
+                                   camrobot_hand_rot)
+
+        current_jnt_values = rbt_s.manipulator_dict['arm'].jlc._ikt.num_ik(tgt_pos=camrobot_hand_pos - init_error - cancel_pos_displacement,
+                                                                           tgt_rot=np.dot(rm.rotmat_from_euler(ai=cancel_euler_displacement[0], aj=cancel_euler_displacement[1], ak=cancel_euler_displacement[2]),
+                                                                                          camrobot_hand_rot),
+                                                                           seed_jnt_values=pre_jnt_values,
+                                                                           tcp_jnt_id=7)
+        onscreen_tcp.append(gm.gen_frame(pos=camrobot_hand_pos - init_error - cancel_pos_displacement,
+                                         rotmat=np.dot(rm.rotmat_from_euler(ai=cancel_euler_displacement[0],
+                                                                            aj=cancel_euler_displacement[1],
+                                                                            ak=cancel_euler_displacement[2]),
+                                                       camrobot_hand_rot)))
+        onscreen_tcp[-1].attach_to(base)
+
+        # 関節角度の更新と衝突判定
+        if current_jnt_values is not None:
+            if abnormal_flag == False:
+                # 異常動作判定
+                if not ((abs(current_jnt_values - pre_jnt_values) <= threshold_abnormal_jnt_values).all() and
+                    abs(np.linalg.norm(current_jnt_values - pre_jnt_values, ord=2)) <= threshold_abnormal_jnt_values_norm):
+                    if operation_count >= 10:
+                        abnormal_flag = True
+            else:
+                # 操作復帰判定
+                abnormal_count += 1
+                if abnormal_count == 1:
+                    # 動作停止時のマニピュレータの手先の位置姿勢の記録
+                    stop_standard_pos, stop_standard_rot = rbt_s.get_gl_tcp()
+                    print("abnormal operation is detected!")
+                else:
+                    camrobot_hand_pos = np.dot(np.linalg.pinv(camrobot_coordinate), data_array[(rgt_hand_num):(rgt_hand_num + 3)])
+                    camrobot_hand_rot = np.dot(np.linalg.pinv(camrobot_coordinate), rm.rotmat_from_quaternion(data_array[(rgt_hand_num + 6):(rgt_hand_num + 10)])[:3, :3])
+
+                    judge = abnormal_judgement(standard_pos=stop_standard_pos, standard_rot=stop_standard_rot,
+                                               current_pos=camrobot_hand_pos - init_error - cancel_pos_displacement,
+                                               current_rot=np.dot(rm.rotmat_from_euler(ai=cancel_euler_displacement[0],
+                                                                                       aj=cancel_euler_displacement[1],
+                                                                                       ak=cancel_euler_displacement[2]),
+                                                                                       camrobot_hand_rot),
+                                               is_stable_cancel=False)
+                    if judge == False:
+                        abnormal_count = 0
+                        abnormal_flag = False
+
+        if abnormal_flag == False and current_jnt_values is not None:
+            rbt_s.fk("arm", current_jnt_values)
+            collided_result = rbt_s.is_collided()
+            if collided_result == True:
+                print('Collided! jnt_values is not updated!')
+                rbt_s.fk("arm", pre_jnt_values)
+            else:
+                pre_jnt_values = current_jnt_values
+
+    onscreen.append(rbt_s.gen_meshmodel())
+    onscreen[-1].attach_to(base)
+
+    # onscreen.append(gm.gen_frame(pos=init_operator_hand_pos, rotmat=init_operator_hand_rot))
+    # onscreen[-1].attach_to(base)
+
+    operation_count += 1
 
     return task.cont
 
 
-
+if __name__ == '__main__':
+    threading.Thread(target=data_collect, args=(data_list,)).start()
+    taskMgr.add(operate_camrobot, "operate_camrobot", extraArgs=None, appendTask=True)
+    base.run()
